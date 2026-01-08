@@ -41,6 +41,7 @@ class BlackjackClient:
             print("UDP socket closed.")
 
     def connect_to_server(self, ip, port):
+        tcp_sock = None
         try:
             tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             tcp_sock.connect((ip, port))
@@ -60,15 +61,69 @@ class BlackjackClient:
         except Exception as e:
             print(f"Connection failed: {e}")
         finally:
-            tcp_sock.close()
+            if tcp_sock is not None:
+                tcp_sock.close()
 
     def handle_gameplay(self, conn):
         """
         Handles the TCP communication during the game.
         """
-        # Logic for sending 'Hit' or 'Stand'
-        # IMPORTANT: Protocol requires 5 bytes for decision: "Hittt" or "Stand" 
-        pass
+        def _encode_decision(decision: str) -> bytes:
+            # Protocol expects exactly 5 bytes; pad with NULs to be safe
+            return decision.encode('utf-8')[:5].ljust(5, b'\x00')
+
+        hand_sum = None
+        hand_cards = []  # track visible cards for the client
+
+        while True:
+            data = conn.recv(BUFFER_SIZE)
+            if not data:
+                print("Server closed connection during gameplay.")
+                break
+
+            try:
+                # Payload: Cookie(4), Type(1), Status(1), Card1(2), Card2(2)
+                if len(data) < 10:
+                    print("Received short payload; ignoring.")
+                    continue
+
+                cookie, msg_type, status, card1, card2 = struct.unpack('!IBBHH', data[:10])
+
+                if cookie != MAGIC_COOKIE or msg_type != MSG_TYPE_PAYLOAD:
+                    # Ignore unrelated/invalid packets
+                    continue
+
+                # Assume: card1 = new card value just dealt to client, card2 = updated player sum
+                hand_cards.append(card1)
+                hand_sum = card2
+                print(f"Player cards={hand_cards}, last card={card1}, sum={hand_sum}, status={status}")
+
+                # Auto-bust handling
+                if status == RESULT_CONTINUE and hand_sum is not None and hand_sum > 21:
+                    print("Busted (sum > 21). Waiting for server result...")
+                    # No decision sent; server should soon send WIN/LOSS/TIE
+                    continue
+
+                if status == RESULT_CONTINUE:
+                    decision = input("Hit or Stand? [h/s]: ").strip().lower()
+                    if decision.startswith('h'):
+                        payload = _encode_decision("Hit")
+                    else:
+                        payload = _encode_decision("Stand")
+
+                    conn.sendall(payload)
+                else:
+                    # Round resolved: WIN/LOSS/TIE
+                    outcome = {
+                        RESULT_WIN: "You win!",
+                        RESULT_LOSS: "You lose.",
+                        RESULT_TIE: "Tie.",
+                    }.get(status, f"Finished with status {status}")
+                    print(outcome)
+                    break
+
+            except Exception as e:
+                print(f"Error handling gameplay payload: {e}")
 
 if __name__ == "__main__":
     # Get number of rounds from user (default to 1 if invalid)
