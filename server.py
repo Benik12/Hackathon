@@ -12,6 +12,7 @@ class BlackjackServer:
         self.running = True
         # Setup TCP socket
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.tcp_sock.bind(('', self.tcp_port))
         self.tcp_sock.listen()
 
@@ -82,10 +83,99 @@ class BlackjackServer:
             conn.close()
 
     def play_round(self, conn):
-        # Placeholder for game logic
-        # Here you will implement: Deck creation, dealing cards, etc.
-        # Sending cards uses the Payload format [cite: 96]
-        pass
+        def build_deck():
+            # Standard 52-card deck, values only (Ace handled in hand_value)
+            deck = []
+            for _ in range(4):
+                # 2-10, J, Q, K as 10, Ace as CARD_VALUE_ACE
+                deck.extend([2,3,4,5,6,7,8,9,10,10,10,10,CARD_VALUE_ACE])
+            random.shuffle(deck)
+            return deck
+
+        def hand_value(cards):
+            total = sum(cards)
+            aces = cards.count(CARD_VALUE_ACE)
+            # Convert Aces from 11 to 1 as needed
+            while total > 21 and aces > 0:
+                total -= 10
+                aces -= 1
+            return total
+
+        def draw_card(deck):
+            if not deck:
+                deck.extend(build_deck())
+            return deck.pop()
+
+        def send_payload(status, card_val, total_val):
+            packet = struct.pack('!IBBHH',
+                                 MAGIC_COOKIE,
+                                 MSG_TYPE_PAYLOAD,
+                                 status,
+                                 card_val,
+                                 total_val)
+            conn.sendall(packet)
+
+        # Build deck and initial deal
+        deck = build_deck()
+        player_cards = [draw_card(deck), draw_card(deck)]
+        dealer_cards = [draw_card(deck), draw_card(deck)]  # dealer_cards[1] is hidden initially
+
+        player_sum = hand_value(player_cards)
+
+        # Send player's initial two cards one by one with updated sum
+        send_payload(RESULT_CONTINUE, player_cards[0], hand_value([player_cards[0]]))
+        send_payload(RESULT_CONTINUE, player_cards[1], player_sum)
+
+        # Send dealer's visible up-card (third initial packet)
+        dealer_up_card = dealer_cards[0]
+        dealer_visible_sum = hand_value([dealer_up_card])
+        send_payload(RESULT_CONTINUE, dealer_up_card, dealer_visible_sum)
+
+        # Player turn
+        while True:
+            if player_sum > 21:
+                send_payload(RESULT_LOSS, 0, player_sum)
+                return
+
+            decision_raw = conn.recv(5)
+            if not decision_raw:
+                return
+            decision = decision_raw.decode('utf-8', errors='ignore').lower()
+            if decision.startswith('h'):
+                new_card = draw_card(deck)
+                player_cards.append(new_card)
+                player_sum = hand_value(player_cards)
+                send_payload(RESULT_CONTINUE, new_card, player_sum)
+                continue
+            else:
+                # Treat anything else as stand
+                break
+
+        # Dealer turn (only if player not busted)
+        dealer_sum = hand_value(dealer_cards)
+
+        # Reveal dealer's hidden card (second initial card) to the client
+        # so the client can show the full dealer hand.
+        send_payload(RESULT_CONTINUE, dealer_cards[1], dealer_sum)
+
+        while dealer_sum < 17:
+            new_card = draw_card(deck)
+            dealer_cards.append(new_card)
+            dealer_sum = hand_value(dealer_cards)
+            # Send dealer hits (informational)
+            send_payload(RESULT_CONTINUE, new_card, dealer_sum)
+
+        # Decide outcome
+        if dealer_sum > 21:
+            result = RESULT_WIN
+        elif player_sum > dealer_sum:
+            result = RESULT_WIN
+        elif dealer_sum > player_sum:
+            result = RESULT_LOSS
+        else:
+            result = RESULT_TIE
+
+        send_payload(result, 0, player_sum)
 
     def get_local_ip(self):
         # Utility to get local IP (simplified)

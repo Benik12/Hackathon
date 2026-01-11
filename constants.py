@@ -18,5 +18,11 @@ RESULT_LOSS = 0x2   # [cite: 101]
 RESULT_TIE = 0x1    # [cite: 101]
 RESULT_CONTINUE = 0x0 # Round is not over [cite: 101]
 
-# Card Suits
+# Card encoding (values sent over the wire)
+# 2-10  -> numeric cards
+# 11    -> Ace (treated as 1 or 11 in scoring)
+# Face cards (J, Q, K) are encoded as value 10
+CARD_VALUE_ACE = 11
+
+# Optional: suits list if you later extend to full card IDs
 SUITS = ['Heart', 'Diamond', 'Club', 'Spade'] # [cite: 31, 103]
