@@ -24,5 +24,18 @@ RESULT_CONTINUE = 0x0 # Round is not over [cite: 101]
 # Face cards (J, Q, K) are encoded as value 10
 CARD_VALUE_ACE = 11
 
-# Optional: suits list if you later extend to full card IDs
-SUITS = ['Heart', 'Diamond', 'Club', 'Spade'] # [cite: 31, 103]
+# Card Rank Constants (for network protocol)
+RANK_ACE = 1
+RANK_JACK = 11
+RANK_QUEEN = 12
+RANK_KING = 13
+
+# Suit Constants (for network protocol)
+SUIT_HEART = 0
+SUIT_DIAMOND = 1
+SUIT_CLUB = 2
+SUIT_SPADE = 3
+
+# Suits list
+SUITS = ['Heart', 'Diamond', 'Club', 'Spade']  # [cite: 31, 103]
+SUIT_SYMBOLS = ['♥', '♦', '♣', '♠']  # For display purposes

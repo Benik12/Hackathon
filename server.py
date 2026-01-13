@@ -60,12 +60,17 @@ class BlackjackServer:
             # Format: Cookie(4), Type(1), Rounds(1), Name(32) [cite: 91-95]
             data = conn.recv(1024)
             if len(data) < 38: # Minimum size check
+                print("Received incomplete request packet")
                 return
             
             cookie, msg_type, rounds, team_name = struct.unpack('!IBB32s', data[:38])
             
-            if cookie != MAGIC_COOKIE or msg_type != MSG_TYPE_REQUEST:
-                print("Invalid packet received.")
+            if cookie != MAGIC_COOKIE:
+                print(f"Invalid magic cookie received: {hex(cookie)}")
+                return
+            
+            if msg_type != MSG_TYPE_REQUEST:
+                print(f"Invalid message type received: {hex(msg_type)}")
                 return
 
             team_name = team_name.decode('utf-8').strip('\x00')
@@ -81,6 +86,31 @@ class BlackjackServer:
             print(f"Client error: {e}")
         finally:
             conn.close()
+
+    def encode_card_for_network(self, card_value):
+        """
+        Convert internal card value to rank + suit encoding for network transmission.
+        
+        Args:
+            card_value: Internal game value (2-11)
+            
+        Returns:
+            tuple: (rank, suit) where rank is 1-13 and suit is 0-3
+        """
+        # Randomly assign a suit (0-3: Heart, Diamond, Club, Spade)
+        suit = random.randint(0, 3)
+        
+        # Map internal value to rank
+        if card_value == CARD_VALUE_ACE:  # 11
+            rank = RANK_ACE  # Ace is rank 1
+        elif card_value == 10:
+            # Could be 10, J, Q, or K - randomly choose for variety
+            rank = random.choice([10, RANK_JACK, RANK_QUEEN, RANK_KING])
+        else:
+            # 2-9 map directly to their rank
+            rank = card_value
+        
+        return rank, suit
 
     def play_round(self, conn):
         def build_deck():
@@ -106,13 +136,28 @@ class BlackjackServer:
                 deck.extend(build_deck())
             return deck.pop()
 
-        def send_payload(status, card_val, total_val):
-            packet = struct.pack('!IBBHH',
+        def send_payload(status, card_val):
+            """
+            Send payload packet to client.
+            Format: Cookie(4) + Type(1) + Result(1) + card_rank(2) + card_suit(1) = 9 bytes
+            
+            Args:
+                status: Game status (RESULT_WIN, RESULT_LOSS, RESULT_TIE, RESULT_CONTINUE)
+                card_val: Internal card value (2-11), or 0 if no card to send
+            """
+            # Encode card to rank + suit if there's a card to send
+            if card_val > 0:
+                rank, suit = self.encode_card_for_network(card_val)
+            else:
+                rank, suit = 0, 0
+            
+            # Pack: Cookie(4) + Type(1) + Status(1) + Rank(2) + Suit(1) = 9 bytes
+            packet = struct.pack('!IBBHB',
                                  MAGIC_COOKIE,
                                  MSG_TYPE_PAYLOAD,
                                  status,
-                                 card_val,
-                                 total_val)
+                                 rank,
+                                 suit)
             conn.sendall(packet)
 
         # Build deck and initial deal
@@ -122,48 +167,67 @@ class BlackjackServer:
 
         player_sum = hand_value(player_cards)
 
-        # Send player's initial two cards one by one with updated sum
-        send_payload(RESULT_CONTINUE, player_cards[0], hand_value([player_cards[0]]))
-        send_payload(RESULT_CONTINUE, player_cards[1], player_sum)
+        # Send player's initial two cards one by one
+        send_payload(RESULT_CONTINUE, player_cards[0])
+        send_payload(RESULT_CONTINUE, player_cards[1])
 
         # Send dealer's visible up-card (third initial packet)
         dealer_up_card = dealer_cards[0]
-        dealer_visible_sum = hand_value([dealer_up_card])
-        send_payload(RESULT_CONTINUE, dealer_up_card, dealer_visible_sum)
+        send_payload(RESULT_CONTINUE, dealer_up_card)
 
         # Player turn
         while True:
             if player_sum > 21:
-                send_payload(RESULT_LOSS, 0, player_sum)
+                send_payload(RESULT_LOSS, 0)
                 return
 
-            decision_raw = conn.recv(5)
-            if not decision_raw:
+            # Receive client decision: Cookie(4) + Type(1) + Decision(5) = 10 bytes
+            decision_raw = conn.recv(10)
+            if not decision_raw or len(decision_raw) < 10:
+                print("Client disconnected or sent incomplete decision packet")
                 return
-            decision = decision_raw.decode('utf-8', errors='ignore').lower()
+            
+            try:
+                cookie, msg_type, decision_bytes = struct.unpack('!IB5s', decision_raw)
+                
+                # Validate magic cookie and message type
+                if cookie != MAGIC_COOKIE:
+                    print(f"Invalid magic cookie in decision: {hex(cookie)}")
+                    return
+                
+                if msg_type != MSG_TYPE_PAYLOAD:
+                    print(f"Invalid message type in decision: {hex(msg_type)}")
+                    return
+                
+                decision = decision_bytes.decode('utf-8', errors='ignore').strip('\x00').lower()
+                
+            except Exception as e:
+                print(f"Error parsing decision packet: {e}")
+                return
+            
             if decision.startswith('h'):
+                # Hit - draw another card
                 new_card = draw_card(deck)
                 player_cards.append(new_card)
                 player_sum = hand_value(player_cards)
-                send_payload(RESULT_CONTINUE, new_card, player_sum)
+                send_payload(RESULT_CONTINUE, new_card)
                 continue
             else:
-                # Treat anything else as stand
+                # Stand - treat anything else as stand
                 break
 
         # Dealer turn (only if player not busted)
         dealer_sum = hand_value(dealer_cards)
 
         # Reveal dealer's hidden card (second initial card) to the client
-        # so the client can show the full dealer hand.
-        send_payload(RESULT_CONTINUE, dealer_cards[1], dealer_sum)
+        send_payload(RESULT_CONTINUE, dealer_cards[1])
 
         while dealer_sum < 17:
             new_card = draw_card(deck)
             dealer_cards.append(new_card)
             dealer_sum = hand_value(dealer_cards)
-            # Send dealer hits (informational)
-            send_payload(RESULT_CONTINUE, new_card, dealer_sum)
+            # Send dealer hits
+            send_payload(RESULT_CONTINUE, new_card)
 
         # Decide outcome
         if dealer_sum > 21:
@@ -175,7 +239,7 @@ class BlackjackServer:
         else:
             result = RESULT_TIE
 
-        send_payload(result, 0, player_sum)
+        send_payload(result, 0)
 
     def get_local_ip(self):
         # Utility to get local IP (simplified)

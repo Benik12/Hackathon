@@ -4,9 +4,12 @@ from constants import *
 
 class BlackjackClient:
     def __init__(self, num_rounds=None):
-        self.team_name = "TeamPlayer"
+        self.team_name = "TeamPlayer"  # TODO: Change to your creative team name!
         self.udp_port = UDP_PORT
         self.num_rounds = num_rounds if num_rounds is not None else 1
+        self.wins = 0
+        self.losses = 0
+        self.ties = 0
         
     def start(self):
         print("Client started, listening for offer requests...") # [cite: 75]
@@ -66,12 +69,46 @@ class BlackjackClient:
             if tcp_sock is not None:
                 tcp_sock.close()
 
+    def decode_card_from_network(self, rank, suit):
+        """
+        Convert rank + suit from network to game value and display string.
+        
+        Args:
+            rank: Card rank (1-13)
+            suit: Card suit (0-3)
+            
+        Returns:
+            tuple: (card_value, display_string)
+        """
+        # Convert rank to game value
+        if rank == RANK_ACE:  # Ace
+            card_value = CARD_VALUE_ACE  # 11 (can be adjusted in hand_value)
+            rank_str = "A"
+        elif rank >= RANK_JACK:  # J, Q, K (11, 12, 13)
+            card_value = 10
+            rank_str = {RANK_JACK: "J", RANK_QUEEN: "Q", RANK_KING: "K"}.get(rank, str(rank))
+        else:  # 2-10
+            card_value = rank
+            rank_str = str(rank)
+        
+        # Get suit symbol
+        suit_symbol = SUIT_SYMBOLS[suit] if 0 <= suit <= 3 else "?"
+        
+        display_string = f"{rank_str}{suit_symbol}"
+        return card_value, display_string
+
     def handle_gameplay(self, conn):
         """
         Handles the TCP communication during the game.
         """
         def _encode_decision(decision: str) -> bytes:
-            return decision.encode('utf-8')[:5].ljust(5, b'\x00')
+            """
+            Encode player decision as proper payload packet.
+            Format: Cookie(4) + Type(1) + Decision(5) = 10 bytes
+            """
+            decision_bytes = decision.encode('utf-8')[:5].ljust(5, b'\x00')
+            packet = struct.pack('!IB5s', MAGIC_COOKIE, MSG_TYPE_PAYLOAD, decision_bytes)
+            return packet
 
         def hand_value(cards):
             total = sum(cards)
@@ -84,14 +121,16 @@ class BlackjackClient:
         round_index = 1
         rounds_left = self.num_rounds
         
-        # 1. Initialize a buffer to hold incoming data across recv calls
+        # Initialize a buffer to hold incoming data across recv calls
         data_buffer = b""
 
         while rounds_left > 0:
             print(f"\n=== Round {round_index} ===")
 
             player_cards = []
+            player_card_displays = []  # For display purposes
             dealer_cards = []
+            dealer_card_displays = []  # For display purposes
             player_sum = None
             dealer_sum = None
 
@@ -103,8 +142,9 @@ class BlackjackClient:
             round_over = False
 
             while not round_over:
-                # 2. Only receive if we don't have a full packet in the buffer
-                if len(data_buffer) < 10:
+                # Only receive if we don't have a full packet in the buffer
+                # Server sends 9-byte packets now
+                if len(data_buffer) < 9:
                     try:
                         data = conn.recv(BUFFER_SIZE)
                         if not data:
@@ -115,77 +155,98 @@ class BlackjackClient:
                         print(f"Connection error: {e}")
                         return
 
-                # 3. Process ALL complete packets currently in the buffer
-                while len(data_buffer) >= 10:
-                    # Slice off the first 10 bytes
-                    packet = data_buffer[:10]
-                    data_buffer = data_buffer[10:] # Keep the remaining bytes!
+                # Process ALL complete packets currently in the buffer
+                while len(data_buffer) >= 9:
+                    # Slice off the first 9 bytes
+                    packet = data_buffer[:9]
+                    data_buffer = data_buffer[9:] # Keep the remaining bytes!
 
                     try:
-                        cookie, msg_type, status, card_val, sum_val = struct.unpack('!IBBHH', packet)
+                        # Unpack: Cookie(4) + Type(1) + Status(1) + Rank(2) + Suit(1) = 9 bytes
+                        cookie, msg_type, status, card_rank, card_suit = struct.unpack('!IBBHB', packet)
 
-                        if cookie != MAGIC_COOKIE or msg_type != MSG_TYPE_PAYLOAD:
+                        if cookie != MAGIC_COOKIE:
+                            print(f"Warning: Invalid magic cookie received: {hex(cookie)}")
                             continue
-
-                        def describe_card(v: int) -> str:
-                            if v == CARD_VALUE_ACE:
-                                return "A(1/11)"
-                            return str(v)
+                        
+                        if msg_type != MSG_TYPE_PAYLOAD:
+                            print(f"Warning: Invalid message type received: {hex(msg_type)}")
+                            continue
 
                         # Check result
                         if status in (RESULT_WIN, RESULT_LOSS, RESULT_TIE):
                             outcome = {
-                                RESULT_WIN: "You win!",
+                                RESULT_WIN: "You win! 🎉",
                                 RESULT_LOSS: "You lose.",
                                 RESULT_TIE: "Tie.",
                             }.get(status, f"Finished with status {status}")
-                            print(f"Result for round {round_index}: {outcome}")
+                            print(f"\nResult for round {round_index}: {outcome}")
+                            
+                            # Update statistics
+                            if status == RESULT_WIN:
+                                self.wins += 1
+                            elif status == RESULT_LOSS:
+                                self.losses += 1
+                            elif status == RESULT_TIE:
+                                self.ties += 1
                             
                             rounds_left -= 1
                             round_index += 1
                             round_over = True # Signal to exit the outer loop
                             break # Break the processing loop
 
+                        # Decode card from rank + suit
+                        card_value, card_display = self.decode_card_from_network(card_rank, card_suit)
+
                         # Logic to determine whose card it is
                         role = None
                         if initial_packets < 2:
-                            player_cards.append(card_val)
+                            # First 2 packets are player's initial cards
+                            player_cards.append(card_value)
+                            player_card_displays.append(card_display)
                             player_sum = hand_value(player_cards)
                             initial_packets += 1
                             role = "player"
                         elif initial_packets == 2:
-                            dealer_cards.append(card_val)
-                            dealer_sum = sum_val
+                            # Third packet is dealer's visible card
+                            dealer_cards.append(card_value)
+                            dealer_card_displays.append(card_display)
+                            dealer_sum = hand_value(dealer_cards)
                             initial_packets += 1
                             role = "dealer"
                         else:
+                            # After initial deal, determine based on context
                             if not player_done and waiting_for_player_card:
-                                player_cards.append(card_val)
+                                player_cards.append(card_value)
+                                player_card_displays.append(card_display)
                                 player_sum = hand_value(player_cards)
                                 waiting_for_player_card = False
                                 role = "player"
                             else:
-                                dealer_cards.append(card_val)
-                                dealer_sum = sum_val
+                                dealer_cards.append(card_value)
+                                dealer_card_displays.append(card_display)
+                                dealer_sum = hand_value(dealer_cards)
                                 role = "dealer"
 
+                        # Display the card
                         if role == "player":
-                            pretty_player = [describe_card(c) for c in player_cards]
-                            print(f"Your cards={pretty_player}, last card={describe_card(card_val)}, sum={player_sum}")
+                            cards_str = ', '.join(player_card_displays)
+                            print(f"Your cards: [{cards_str}], last card: {card_display}, sum: {player_sum}")
                         elif role == "dealer":
-                            pretty_dealer = [describe_card(c) for c in dealer_cards]
-                            print(f"Dealer cards={pretty_dealer}, last card={describe_card(card_val)}, dealer_sum={dealer_sum}")
+                            cards_str = ', '.join(dealer_card_displays)
+                            print(f"Dealer cards: [{cards_str}], last card: {card_display}, dealer sum: {dealer_sum}")
 
+                        # Check for bust
                         if role == "player" and player_sum is not None and player_sum > 21:
-                            print("Busted (sum > 21). Waiting for server result...")
+                            print("💥 Busted (sum > 21)! Waiting for server result...")
                             player_done = True
                             waiting_for_player_card = False
                             continue
 
-                        # Input Prompt
+                        # Input Prompt - ask for decision after initial deal
                         if (
                             status == RESULT_CONTINUE
-                            and initial_packets >= 3  
+                            and initial_packets >= 3  # After initial 3 cards
                             and not player_done
                             and player_sum is not None
                             and player_sum <= 21
@@ -193,7 +254,7 @@ class BlackjackClient:
                         ):
                             decision = input("Hit or Stand? [h/s]: ").strip().lower()
                             if decision.startswith('h'):
-                                payload = _encode_decision("Hit")
+                                payload = _encode_decision("Hittt")
                                 waiting_for_player_card = True
                             else:
                                 payload = _encode_decision("Stand")
@@ -205,7 +266,14 @@ class BlackjackClient:
                     except Exception as e:
                         print(f"Error handling gameplay payload: {e}")
 
-        print("\nAll rounds completed.")
+        # Print final statistics
+        print(f"\n{'='*50}")
+        print(f"Finished playing {self.num_rounds} rounds!")
+        print(f"Wins: {self.wins}, Losses: {self.losses}, Ties: {self.ties}")
+        if self.num_rounds > 0:
+            win_rate = (self.wins / self.num_rounds) * 100
+            print(f"Win rate: {win_rate:.1f}%")
+        print(f"{'='*50}")
 
 if __name__ == "__main__":
     # Get number of rounds from user (default to 1 if invalid)
